@@ -1,0 +1,8 @@
+# per-PC / private - never uploaded
+.venv/
+chrome-profile/
+output/
+sample/
+app/__pycache__/
+*.zip
+~$*
