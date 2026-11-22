@@ -15,6 +15,7 @@ in the output workbook and run again.
 """
 import re
 import sys
+import json
 import time
 import datetime
 import subprocess
@@ -34,7 +35,17 @@ except ImportError as e:
 
 # ----------------------------- SETTINGS ------------------------------------
 INPUT_SHEET = "Focused Data"       # sheet to process (first sheet is used if this one is missing)
-SAVE_EVERY_N_SCHOOLS = 1           # save the output workbook after this many schools
+SAVE_EVERY_N_SCHOOLS = 1           # save the output workbook after this many schools (name-search mode)
+
+# BULK MODE: ONE captcha lists every school of the district (Advance Search); then every report
+# card is opened directly - no more captchas. Schools not in that list fall back to name search.
+BULK_MODE = True
+BULK_STATE = "MAHARASHTRA"
+BULK_DISTRICT = "PUNE"
+BULK_DELAY_SECONDS = 1.0           # polite pause between report cards
+BULK_SAVE_EVERY = 10               # in bulk mode save after this many schools (and when stopping)
+ID_CACHE_DAYS = 7                  # reuse the district list for this many days (no captcha on resume)
+DEFAULT_YEAR_SEG = "13"            # report-card address year part, used only if it could not be learnt
 DEFAULT_STATE = "MAHARASHTRA"      # used when the State column is empty / missing
 MAX_CANDIDATES_TO_FETCH = 10       # if several schools match, fetch data for up to this many
 RETRY_WITH_SHORT_NAME = True       # 0 results -> one more search with the first 2 words of the name
@@ -393,6 +404,8 @@ class KYS:
         self.nodata_snapshots = 0
         self.social_count = 0   # report-card data calls seen (used to wait for real numbers)
         self.rc_count = 0
+        self.region_count = 0   # Advance Search (district) responses seen
+        self.last_region = None
         page.on("response", self._on_response)
 
     def _on_response(self, r):
@@ -400,6 +413,9 @@ class KYS:
         if "search-schools" in u:
             self.search_count += 1
             self.last_search = r
+        elif "search-school/by-region" in u:
+            self.region_count += 1
+            self.last_region = r
         elif "getSocialData" in u:
             self.social_count += 1
         elif "school/report-card" in u:
@@ -557,11 +573,100 @@ class KYS:
                               "name": "", "district": "", "block": "", "pin": ""})
         return cards, max(total, len(cards))
 
-    def _school_ids(self):
+    # ---- bulk: one Advance Search for a whole district ----
+    def open_advance(self, state, district):
+        """Search page (full load) -> Advance Search -> State + District selected, cursor in captcha."""
+        p = self.page
+        for attempt in range(3):
+            try:
+                if attempt % 2 == 0:
+                    p.goto(SEARCH_URL, wait_until="domcontentloaded")
+                    p.reload(wait_until="domcontentloaded")
+                else:   # fallback: home page first (loads the State list), then the search page
+                    p.goto(SITE, wait_until="domcontentloaded")
+                    p.reload(wait_until="domcontentloaded")
+                    p.wait_for_timeout(2000)
+                    p.goto(SEARCH_URL, wait_until="domcontentloaded")
+                p.get_by_text("Advance Search").first.click(timeout=20000)
+                # the State list appears only once the Advance Search panel is open
+                p.wait_for_function("() => [...document.querySelectorAll('select')].some(s => "
+                                    "s.getClientRects().length && [...s.options].some(o => o.text.trim() === 'MAHARASHTRA'))",
+                                    timeout=20000)
+                st = p.locator("select:visible").filter(
+                    has=p.locator("option", has_text=re.compile(rf"^\s*{re.escape(state)}\s*$", re.I))).first
+                st.select_option(label=next(l.strip() for l in st.locator("option").all_inner_texts()
+                                            if l.strip().upper() == state.upper()))
+                p.wait_for_function("(d) => [...document.querySelectorAll('select')].some(s => "
+                                    "[...s.options].some(o => o.text.trim().toUpperCase() === d))",
+                                    arg=district.upper(), timeout=20000)
+                dt = p.locator("select:visible").filter(
+                    has=p.locator("option", has_text=re.compile(rf"^\s*{re.escape(district)}\s*$", re.I))).first
+                dt.select_option(label=next(l.strip() for l in dt.locator("option").all_inner_texts()
+                                            if l.strip().upper() == district.upper()))
+                cap = p.locator('input[placeholder="Enter Captcha"]:visible').first
+                cap.fill("")
+                cap.scroll_into_view_if_needed()
+                cap.focus()
+                return
+            except PWError as e:
+                if "closed" in str(e).lower():
+                    raise
+                log("  (advance search not ready, retrying...)")
+        raise RuntimeError("Advance Search form did not load. Check internet.")
+
+    def region_search_with_captcha(self, state, district):
+        """One captcha -> list of every school in the district. Returns {udise: school_id}."""
+        p = self.page
+        self.open_advance(state, district)
+        p.bring_to_front()
+        msg = f"ONE-TIME district search: {state} / {district}  ->  type the CAPTCHA above (search starts automatically)"
+        self.banner(msg)
+        log(f"  Waiting for captcha...  (Advance Search: {state} / {district})")
+        if BEEP_WHEN_CAPTCHA_NEEDED:
+            try:
+                import winsound
+                winsound.MessageBeep()
+            except Exception:
+                pass
+        start, submitted = self.region_count, None
+        deadline = time.time() + CAPTCHA_WAIT_MINUTES * 60
+        while time.time() < deadline:
+            p.wait_for_timeout(300)
+            if self.region_count == start:
+                if AUTO_SEARCH_AFTER_CAPTCHA:
+                    try:
+                        val = p.locator('input[placeholder="Enter Captcha"]:visible').first.input_value().strip()
+                    except PWError:
+                        val = ""
+                    if len(val) >= CAPTCHA_LENGTH and val != submitted:
+                        submitted = val
+                        try:
+                            p.locator("button:visible", has_text=re.compile(r"^\s*Search\s*$")).first.click()
+                        except PWError:
+                            pass
+                continue
+            p.wait_for_timeout(2500)          # big result - let the page take it in
+            ids = self._school_ids(self.last_region)
+            if not ids and self.invalid_captcha_shown():
+                log("  Wrong captcha - please try again.")
+                self.open_advance(state, district)
+                self.banner("WRONG CAPTCHA - type the new captcha (district search)", bad=True)
+                start, submitted = self.region_count, None
+                continue
+            if not self.year_seg:
+                try:
+                    self._learn_year_seg()     # one Report Card click shows the report-card address format
+                except PWError:
+                    pass
+            return ids
+        return None
+
+    def _school_ids(self, resp=None):
         """UDISE code -> site's internal school id, taken from the search result the page received."""
         out = {}
+        resp = resp or self.last_search
         try:
-            js = self.last_search.json() if self.last_search else None
+            js = resp.json() if resp else None
         except Exception:
             return out
 
@@ -796,6 +901,57 @@ def process_school(kys, rec, progress):
                        f"in your list to pick one{extra}. {kw_note}".strip()}, match_rows
 
 
+class BrowserClosed(Exception):
+    def __init__(self, rec):
+        super().__init__("browser closed")
+        self.rec = rec
+
+
+def is_closed(e):
+    s = str(e).lower()
+    return "closed" in s or "target page" in s or "target crashed" in s
+
+
+ID_CACHE_FILE = OUTPUT_DIR / "school_ids.json"
+
+
+def load_id_cache():
+    """District list saved by an earlier run: ({udise: school_id}, year_seg) or ({}, '')."""
+    try:
+        d = json.loads(ID_CACHE_FILE.read_text(encoding="utf-8"))
+        made = datetime.datetime.fromisoformat(d["created"])
+        if (d.get("state"), d.get("district")) != (BULK_STATE, BULK_DISTRICT):
+            return {}, ""
+        if (datetime.datetime.now() - made).days >= ID_CACHE_DAYS:
+            return {}, ""
+        return d["ids"], d.get("year_seg", "")
+    except Exception:
+        return {}, ""
+
+
+def save_id_cache(ids, year_seg):
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    ID_CACHE_FILE.write_text(json.dumps({
+        "created": datetime.datetime.now().isoformat(timespec="seconds"),
+        "state": BULK_STATE, "district": BULK_DISTRICT, "year_seg": year_seg, "ids": ids}), encoding="utf-8")
+
+
+def bulk_fetch(kys, rec, school_id):
+    """Opens one school's report card directly (no search, no captcha) and returns its result row."""
+    cand = {"idx": -1, "href": "", "udise": rec["udise"], "school_id": school_id,
+            "name": rec["name"], "district": "", "block": "", "pin": ""}
+    try:
+        data, remark, url = kys.fetch_report(cand)
+    except PWError as e:
+        if is_closed(e):
+            raise BrowserClosed(rec)
+        return {"Status": "ERROR", "Remarks": "ERROR reading report card: " + str(e).strip().splitlines()[0][:200]}
+    except Exception as e:
+        return {"Status": "ERROR", "Remarks": "ERROR reading report card: " + (str(e).strip().splitlines() or ["?"])[0][:200]}
+    nodata = data.pop("_nodata", False)
+    return {**data, "Status": "NO DATA" if nodata else "OK", "Remarks": remark}
+
+
 def launch_browser(p):
     """Opens a normal (non-private) Chrome window with its own saved profile in the
     'chrome-profile' folder. (Chrome does not allow automation of your main everyday profile.)"""
@@ -848,8 +1004,12 @@ def main():
     if len(pending) < len(records):
         log(f"\n>> RESUMING from row {pending[0]['row']}: {pending[0]['name']}"
             f"  ({len(records) - len(pending)} schools already saved)")
-    log("\nA browser window will open. For each school just type the CAPTCHA"
-        + (" - Search is clicked automatically." if AUTO_SEARCH_AFTER_CAPTCHA else " and press ENTER."))
+    if BULK_MODE:
+        log("\nA browser window will open. BULK MODE: at most one captcha for the whole district,"
+            "\nthen schools are read automatically. Leave the window open.")
+    else:
+        log("\nA browser window will open. For each school just type the CAPTCHA"
+            + (" - Search is clicked automatically." if AUTO_SEARCH_AFTER_CAPTCHA else " and press ENTER."))
     log("Press Ctrl+C here to stop at any time (progress is saved).\n")
 
     stats = {"OK": 0, "MULTIPLE MATCHES": 0, "NOT FOUND": 0, "ERROR": 0, "SKIPPED": 0}
@@ -859,17 +1019,63 @@ def main():
         page.set_default_timeout(30000)
         kys = KYS(page)
         try:
-            for i, rec in enumerate(pending, 1):
-                progress = f"School {i} of {len(pending)}"
-                log(f"[{i}/{len(pending)}] Row {rec['row']}: {rec['name']}")
+            leftover = pending
+            # ---------- BULK: one captcha for the district, then automatic report cards ----------
+            if BULK_MODE and any(r["udise"] for r in pending):
+                ids, year = load_id_cache()
+                if ids:
+                    log(f"Using the saved district list ({len(ids)} schools) - no captcha needed.")
+                else:
+                    log(f"STEP 1 - ONE captcha lists every school in {BULK_DISTRICT} district.")
+                    try:
+                        ids = kys.region_search_with_captcha(BULK_STATE, BULK_DISTRICT) or {}
+                    except PWError as e:
+                        if is_closed(e):
+                            raise BrowserClosed(pending[0])
+                        log(f"  District search problem: {str(e).splitlines()[0][:150]}")
+                        ids = {}
+                    except RuntimeError as e:
+                        log(f"  District search problem: {e}")
+                        ids = {}
+                    if ids:
+                        save_id_cache(ids, kys.year_seg)
+                        log(f"  District list received: {len(ids)} schools.")
+                    else:
+                        log("  District search did not work - continuing with name search for every school.")
+                kys.year_seg = kys.year_seg or year or DEFAULT_YEAR_SEG
+                bulk = [r for r in pending if r["udise"] in ids]
+                leftover = [r for r in pending if r["udise"] not in ids]
+                if bulk:
+                    log(f"\nSTEP 2 - {len(bulk)} schools are read AUTOMATICALLY (no captcha). Leave the window open."
+                        + (f"\n         {len(leftover)} school(s) not in the district list get a name search after."
+                           if leftover else "") + "\n")
+                for i, rec in enumerate(bulk, 1):
+                    log(f"[auto {i}/{len(bulk)}] Row {rec['row']}: {rec['name']}")
+                    result = bulk_fetch(kys, rec, ids[rec["udise"]])   # raises BrowserClosed
+                    store.set_result(rec, result, [])
+                    if store.unsaved >= BULK_SAVE_EVERY:
+                        store.save(force=True)
+                    st = result.get("Status", "ERROR")
+                    stats[st] = stats.get(st, 0) + 1
+                    log(f"  {st}: total={result.get('Grand Total')}" if st in ("OK", "NO DATA")
+                        else f"  {st} - {result.get('Remarks')}")
+                    kys.banner(f"AUTOMATIC: {i} of {len(bulk)} done - no captcha needed, leave this window open")
+                    page.wait_for_timeout(int(BULK_DELAY_SECONDS * 1000))
+                store.save(force=True)
+                if leftover:
+                    log(f"\nSTEP 3 - name search (captcha) for {len(leftover)} school(s) not in the district list.\n")
+            # ---------- NAME SEARCH: one captcha per school ----------
+            for i, rec in enumerate(leftover, 1):
+                progress = f"School {i} of {len(leftover)}"
+                log(f"[{i}/{len(leftover)}] Row {rec['row']}: {rec['name']}")
                 try:
                     result, match_rows = process_school(kys, rec, progress)
                 except PWError as e:
-                    if "closed" in str(e).lower() or "target" in str(e).lower():
-                        log("\nBrowser was closed - stopping. Progress is saved.")
-                        log(f">> Next time start.bat continues from row {rec['row']}: {rec['name']}")
-                        break
+                    if is_closed(e):
+                        raise BrowserClosed(rec)
                     result, match_rows = {"Status": "ERROR", "Remarks": str(e)[:300]}, []
+                except BrowserClosed:
+                    raise
                 except Exception as e:
                     result, match_rows = {"Status": "ERROR", "Remarks": str(e)[:300]}, []
                 store.set_result(rec, result, match_rows)
@@ -877,6 +1083,9 @@ def main():
                 st = result.get("Status", "ERROR")
                 stats[st] = stats.get(st, 0) + 1
                 log(f"  Status: {st}" + (f" - {result.get('Remarks')}" if st != "OK" else "") + "\n")
+        except BrowserClosed as bc:
+            log("\nBrowser was closed - stopping. Progress is saved.")
+            log(f">> Next time start.bat continues from row {bc.rec['row']}: {bc.rec['name']}")
         except KeyboardInterrupt:
             log("\nStopped by user. Progress is saved - run start.bat again to continue.")
         finally:

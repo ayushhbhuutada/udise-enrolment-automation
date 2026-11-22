@@ -6,8 +6,13 @@ For every school in your list it searches https://kys.udiseplus.gov.in by School
 picks the result whose UDISE code matches the list's "School Code" column, opens the
 school's Report Card and copies "Enrolment by grade in the current academic session".
 
-YOUR ONLY JOB: type the captcha for each school. Search is clicked automatically once
-6 characters are typed. Everything else is automatic.
+BULK MODE (default): at the start you type ONE captcha - the site's Advance Search then lists
+every school in Pune district (8,000+). After that every school's Report Card is opened
+automatically, with NO more captchas. Only the few schools that are not in the district list
+(e.g. Army / Air Force schools) get a normal name search, one captcha each, at the end.
+The district list is saved (output\school_ids.json) and reused for 7 days, so stopping and
+starting again needs no captcha at all. Search is clicked automatically once 6 characters
+of a captcha are typed.
 
 
 FILES
